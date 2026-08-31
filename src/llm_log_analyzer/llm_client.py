@@ -16,13 +16,13 @@ ANALYSIS_FORMAT_INSTRUCTIONS = """
 Provide your analysis as a structured JSON object:
 
 ```json
-{{
+{
   "root_cause": "Detailed description of the primary root cause",
   "relevant_lines": ["Most relevant log lines that led to this conclusion"],
   "confidence": 0.85,
   "action_suggestion": "Specific actionable steps to fix the root cause",
   "human_summary": "Provide a concise summary (up to 6 sentences) suitable for Slack notifications or merge request comments. Focus on what went wrong and how to fix it."
-}}
+}
 ```
 **confidence** is a number between 0 and 1 that represents your confidence in the analysis - be conservative here.
 
@@ -33,6 +33,34 @@ IMPORTANT:
 - Keep string values concise and on single lines on root cause and action suggestion
 - For breaking lines in human summary, use `\\n`
 """
+
+# Appended only when the caller supplies a class list, so the default prompt and
+# the default output are byte-for-byte unchanged for everyone else.
+FAILURE_CLASS_INSTRUCTIONS = """
+
+Additionally, include a `"failure_class"` key whose value is EXACTLY one of the
+following identifiers, chosen for the failure you just described:
+
+{classes}
+
+Rules for `failure_class`:
+- Copy one identifier verbatim. Do not invent, abbreviate or combine them.
+- Choose `unknown` when no identifier fits. A wrong identifier is worse than
+  `unknown`, because it sends the failure to the wrong owner.
+- The identifier describes WHO OWNS the failure, not what the error text was.
+- It is independent of `confidence`: report the class you believe is right and
+  let `confidence` carry your certainty.
+"""
+
+UNCLASSIFIED_FALLBACK = "unknown"
+
+
+def build_analysis_format_instructions(failure_classes: Optional[List[str]] = None) -> str:
+    """Schema block for the aggregation prompt, plus the class enum when supplied."""
+    if not failure_classes:
+        return ANALYSIS_FORMAT_INSTRUCTIONS
+    listed = "\n".join(f"  - {c}" for c in failure_classes)
+    return ANALYSIS_FORMAT_INSTRUCTIONS + FAILURE_CLASS_INSTRUCTIONS.format(classes=listed)
 
 CHUNK_FORMAT_INSTRUCTIONS = """
 Provide a concise summary (up to 10 sentences) of the most important issues found in this chunk. Include the main relevant log lines that led to this conclusion (up to 5 lines).
@@ -51,14 +79,17 @@ class AnalysisResult:
     confidence: float
     action_suggestion: str
     human_summary: str
+    failure_class: str = ""
 
 class LLMAnalyzer:
     """Handles analysis logic and prompting using an LLM provider."""
     
-    def __init__(self, provider: LLMProvider, debug_output_dir: Optional[str] = None):
+    def __init__(self, provider: LLMProvider, debug_output_dir: Optional[str] = None,
+                 failure_classes: Optional[List[str]] = None):
         self.provider = provider
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self.debug_output_dir = debug_output_dir
+        self.failure_classes = list(failure_classes) if failure_classes else []
     
     def _save_debug_prompt(self, prompt: str, filename: str) -> None:
         """Save the final formatted prompt to a debug file."""
@@ -120,7 +151,7 @@ class LLMAnalyzer:
         
         formatted_prompt = prompt_intro + "\n\n" + AGGREGATION_ANALYSIS_INSTRUCTION
         formatted_prompt += "\n\n---\n\n" + chunk_header_text + chunk_summaries_text
-        formatted_prompt += ANALYSIS_FORMAT_INSTRUCTIONS
+        formatted_prompt += build_analysis_format_instructions(self.failure_classes)
         
         if additional_context.strip():
             formatted_prompt += f"\n\n---\n\nAdditional Context:\n{additional_context}"
@@ -132,6 +163,20 @@ class LLMAnalyzer:
         
         return self._parse_aggregation_response(response)
     
+    def _validate_failure_class(self, value: Any) -> str:
+        """Coerce the model's class to one we asked for; anything else is `unknown`."""
+        if not self.failure_classes:
+            return ""
+        candidate = str(value or "").strip()
+        if candidate in self.failure_classes:
+            return candidate
+        if candidate:
+            self.logger.warning(
+                f"Model returned failure_class {candidate!r}, which is not in the "
+                f"supplied enum; recording {UNCLASSIFIED_FALLBACK!r} instead"
+            )
+        return UNCLASSIFIED_FALLBACK
+
     def _parse_aggregation_response(self, response: str) -> AnalysisResult:
         """Parse the aggregation response to extract structured data."""
         try:
@@ -144,6 +189,7 @@ class LLMAnalyzer:
                 confidence=float(analysis_data.get("confidence", 0.5)),
                 action_suggestion=analysis_data.get("action_suggestion", "No specific action suggested"),
                 human_summary=analysis_data.get("human_summary", "No human summary was found in the response"),
+                failure_class=self._validate_failure_class(analysis_data.get("failure_class")),
             )
             
         except json.JSONDecodeError as e:
@@ -163,7 +209,8 @@ class LLMAnalyzer:
                 relevant_lines=[],
                 confidence=0.0,
                 action_suggestion="Review logs manually",
-                human_summary=f"Analysis failed due to parsing error: {str(e)}"
+                human_summary=f"Analysis failed due to parsing error: {str(e)}",
+                failure_class=UNCLASSIFIED_FALLBACK if self.failure_classes else "",
             )
     
     def _sanitize_json_string(self, json_str: str) -> str:
@@ -249,13 +296,14 @@ class LLMAnalyzer:
             relevant_lines=[],
             confidence=confidence,
             action_suggestion=action_suggestion,
-            human_summary=human_summary
+            human_summary=human_summary,
+            failure_class=UNCLASSIFIED_FALLBACK if self.failure_classes else "",
         )
 
 class LLMClient:
     """Main LLM client that uses different providers and analyzers."""
     
-    def __init__(self, provider, debug_output_dir: str = ".", chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None):
+    def __init__(self, provider, debug_output_dir: str = ".", chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None, failure_classes: Optional[List[str]] = None):
         """
         Initialize the LLM client with a specific provider.
         
@@ -264,13 +312,15 @@ class LLMClient:
             debug_output_dir: Directory for debug output files
             chunk_model: Model to use for chunk analysis (if not provided, uses provider default)
             aggregation_model: Model to use for aggregation analysis (if not provided, uses provider default)
+            failure_classes: Closed list of failure-class identifiers the model must choose from.
+                When omitted, no classification is requested and the prompt is unchanged.
         """
         self.provider_type = type(provider).__name__
         self.provider = provider
         self.logger = logging.getLogger(__name__)
         self.chunk_model = chunk_model or self.provider.get_default_chunk_model()
         self.aggregation_model = aggregation_model or self.provider.get_default_aggregation_model()
-        self.analyzer = LLMAnalyzer(self.provider, debug_output_dir)
+        self.analyzer = LLMAnalyzer(self.provider, debug_output_dir, failure_classes=failure_classes)
 
         self.logger.info(f"Initialized LLM client with provider {self.provider_type}, aggregation model {self.aggregation_model}, chunk model {self.chunk_model}")
     

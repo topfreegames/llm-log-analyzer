@@ -167,9 +167,45 @@ The analyzer generates two output files:
   ],
   "confidence": 0.95,
   "action_suggestion": "Add a definition for the 'Armadillo' character to the 'CharacterEnum' enum in the CharacterSoundControllerFactory.cs file. Ensure the enum is updated whenever new characters are introduced.",
-  "human_summary": "The Unity build failed due to a script compilation error. The error message indicates that `CharacterEnum` is missing a definition for 'Armadillo'.  This likely happened because a new character, 'Armadillo', was added without updating the corresponding enum. To fix this, add a new entry for 'Armadillo' to the `CharacterEnum` enum in the `CharacterSoundControllerFactory.cs` file."
+  "human_summary": "The Unity build failed due to a script compilation error. The error message indicates that `CharacterEnum` is missing a definition for 'Armadillo'.  This likely happened because a new character, 'Armadillo', was added without updating the corresponding enum. To fix this, add a new entry for 'Armadillo' to the `CharacterEnum` enum in the `CharacterSoundControllerFactory.cs` file.",
+  "failure_class": ""
 }
 ```
+
+`failure_class` is empty unless `--failure-classes` is supplied; see
+[Classifying failures](#classifying-failures).
+
+### Classifying failures
+
+`--failure-classes` asks the model to place the failure into a **closed list** of
+identifiers you supply, and records its choice in `failure_class`:
+
+```bash
+# inline
+llm-log-analyzer build.log --failure-classes licensing_down,dependency,project_code,unknown
+
+# or from a file, one identifier per line (`#` comments allowed)
+llm-log-analyzer build.log --failure-classes @enum.txt
+```
+
+The analyzer deliberately does **not** ship an enum of its own. Whatever consumes
+the classification — a metrics exporter, a dashboard, an alerting rule — owns the
+list and passes it in, so there is exactly one definition to keep in step with the
+queries built on it.
+
+Guarantees worth relying on:
+
+- **Opt-in.** Without the flag the prompt and the output are unchanged, and
+  `failure_class` is `""`.
+- **Closed.** A value outside your list is replaced with `unknown` and logged as a
+  warning. The model cannot widen the enum by inventing an identifier.
+- **Always present when asked.** Every path — a value outside the list, a missing
+  key, an unparseable response — yields `unknown` rather than an empty or absent
+  field, so a consumer can distinguish "the analyzer ran and could not classify"
+  from "the analyzer never ran".
+
+Include `unknown` in your list and say so in the identifier names: the model is
+told the class describes *who owns* the failure, not what the error text said.
 
 2. **`analysis.md`** - Human-friendly Markdown summary for Slack/MR comments:
 ```markdown

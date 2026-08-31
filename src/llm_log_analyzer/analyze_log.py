@@ -240,6 +240,11 @@ class OutputGenerator:
         """Generate Markdown content for the analysis result."""
         confidence_emoji = get_confidence_emoji(result.confidence)
         
+        failure_class = getattr(result, "failure_class", "")
+        failure_class_section = (
+            f"\n**Failure Class:** `{failure_class}`\n" if failure_class else ""
+        )
+        
         provider_section = ""
         if analyzer and analyzer.llm_client:
             try:
@@ -268,6 +273,7 @@ class OutputGenerator:
 ## Analysis Details
 
 **Root Cause:** {result.root_cause}
+{failure_class_section}
 
 **Confidence:** {confidence_emoji} {result.confidence:.1%}
 
@@ -295,7 +301,7 @@ class OutputGenerator:
 class LogAnalyzer:
     """Main analyzer class that orchestrates the entire analysis process."""
     
-    def __init__(self, provider: Optional[str] = None, api_key: Optional[str] = None, output_dir: str = DEFAULT_OUTPUT_DIR, verbose: bool = False, quiet: bool = False, debug: bool = False, max_chunks: int = DEFAULT_MAX_CHUNKS, max_workers: int = DEFAULT_MAX_PARALLEL_CHUNKS, context_lines: int = DEFAULT_CONTEXT_LINES, chunk_size: int = DEFAULT_CHUNK_SIZE, filter_keywords: List[str] = DEFAULT_FILTER_KEYWORDS, filter_regex: Optional[str] = None, preset: Optional[str] = None, patterns_file: str = None, prompt: Optional[str] = None, prompt_file: Optional[str] = None, additional_context_file: str = None, chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None, timeout: Optional[float] = None):
+    def __init__(self, provider: Optional[str] = None, api_key: Optional[str] = None, output_dir: str = DEFAULT_OUTPUT_DIR, verbose: bool = False, quiet: bool = False, debug: bool = False, max_chunks: int = DEFAULT_MAX_CHUNKS, max_workers: int = DEFAULT_MAX_PARALLEL_CHUNKS, context_lines: int = DEFAULT_CONTEXT_LINES, chunk_size: int = DEFAULT_CHUNK_SIZE, filter_keywords: List[str] = DEFAULT_FILTER_KEYWORDS, filter_regex: Optional[str] = None, preset: Optional[str] = None, patterns_file: str = None, prompt: Optional[str] = None, prompt_file: Optional[str] = None, additional_context_file: str = None, chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None, timeout: Optional[float] = None, failure_classes: Optional[List[str]] = None):
         """
             Initialize the log analyzer.
             
@@ -320,6 +326,7 @@ class LogAnalyzer:
                 chunk_model: Model to use for chunk analysis (if not provided, uses provider default)
                 aggregation_model: Model to use for aggregation analysis (if not provided, uses provider default)
                 timeout: Timeout in seconds for API requests (None means no timeout)
+                failure_classes: Closed list of failure-class identifiers for the model to choose from
         """
         # Determine log level: verbose > quiet > default
         if verbose:
@@ -340,7 +347,7 @@ class LogAnalyzer:
         
         try:
             self.llm_provider = create_llm_provider(provider=provider, api_key=api_key, timeout=timeout)
-            self.llm_client = LLMClient(provider=self.llm_provider, debug_output_dir=self.debug_output_dir, chunk_model=chunk_model, aggregation_model=aggregation_model)
+            self.llm_client = LLMClient(provider=self.llm_provider, debug_output_dir=self.debug_output_dir, chunk_model=chunk_model, aggregation_model=aggregation_model, failure_classes=failure_classes)
                         
         except Exception as e:
             self.logger.error(f"Failed to initialize LLM client: {e}")
@@ -670,6 +677,8 @@ def format_analysis_summary(result: AnalysisResult, provider_info: dict, markdow
     
     summary_parts = []
     summary_parts.append(f"Root Cause: {result.root_cause}")
+    if getattr(result, "failure_class", ""):
+        summary_parts.append(f"Failure Class: {result.failure_class}")
     summary_parts.append(f"Confidence: {confidence_emoji} {result.confidence:.1%}")
     summary_parts.append(f"Provider: {provider_info['provider']}")
     
@@ -859,6 +868,16 @@ Examples:
     )
     
     parser.add_argument(
+        '--failure-classes',
+        type=str,
+        default=None,
+        help=('Closed list of failure-class identifiers the model must choose from, '
+              'comma-separated, or @PATH to read one identifier per line. When omitted '
+              'no classification is requested and the prompt is unchanged. Intended to be '
+              'fed from whatever tool owns the enum, so the list has a single home.')
+    )
+
+    parser.add_argument(
         '-v', '--verbose', 
         action='store_true',
         help='Enable verbose logging'
@@ -900,6 +919,22 @@ Examples:
         return
     
     try:
+        failure_classes = None
+        if args.failure_classes:
+            spec = args.failure_classes.strip()
+            if spec.startswith('@'):
+                class_path = spec[1:]
+                try:
+                    with open(class_path, 'r', encoding='utf-8') as f:
+                        raw = [line.split('#', 1)[0].strip() for line in f]
+                except OSError as e:
+                    parser.error(f"could not read --failure-classes file {class_path}: {e}")
+            else:
+                raw = spec.split(',')
+            failure_classes = [c.strip() for c in raw if c.strip()]
+            if not failure_classes:
+                parser.error("--failure-classes was given but resolved to an empty list")
+
         analyzer = LogAnalyzer(
             provider=args.provider,
             api_key=args.api_key,
@@ -920,7 +955,8 @@ Examples:
             additional_context_file=args.additional_context_file,
             chunk_model=args.chunk_model,
             aggregation_model=args.aggregation_model,
-            timeout=args.timeout
+            timeout=args.timeout,
+            failure_classes=failure_classes
         )
         
         result, has_failures = analyzer.analyze_log_file(args.log, args.tail_lines)
