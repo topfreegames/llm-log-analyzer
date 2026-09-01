@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Mapping, Optional, List, Sequence, Union
 from dataclasses import dataclass
 from llm_log_analyzer.constants import CHUNK_PROMPT_FILE, AGGREGATION_PROMPT_FILE, CHUNK_RESPONSE_FILE, AGGREGATION_RESPONSE_FILE
 from llm_log_analyzer.providers import LLMProvider
@@ -45,22 +45,94 @@ following identifiers, chosen for the failure you just described:
 
 Rules for `failure_class`:
 - Copy one identifier verbatim. Do not invent, abbreviate or combine them.
-- Choose `unknown` when no identifier fits. A wrong identifier is worse than
-  `unknown`, because it sends the failure to the wrong owner.
-- The identifier describes WHO OWNS the failure, not what the error text was.
+{match_rule}- Choose `{fallback}` when no identifier fits. A wrong identifier is worse than
+  `{fallback}`, because it sends the failure to the wrong owner.
 - It is independent of `confidence`: report the class you believe is right and
   let `confidence` carry your certainty.
 """
 
-UNCLASSIFIED_FALLBACK = "unknown"
+# Only used when the caller's own enum contains it. Nothing here invents a class:
+# see resolve_failure_class_fallback.
+DEFAULT_UNCLASSIFIED_FALLBACK = "unknown"
+
+# A fact about the request rather than the model's opinion of it: whether the
+# caller's additional-context file reached the prompt that chose the class.
+# Context is known to change the class the model picks, so a consumer can require
+# it before acting on one - unlike `confidence`, which is the model grading its
+# own answer.
+CLASSIFICATION_CONTEXT_PROVIDED = "provided"
+CLASSIFICATION_CONTEXT_ABSENT = "absent"
+
+# What a caller may hand us: bare identifiers, or identifier -> description.
+FailureClassSpec = Union[Sequence[str], Mapping[str, str]]
 
 
-def build_analysis_format_instructions(failure_classes: Optional[List[str]] = None) -> str:
-    """Schema block for the aggregation prompt, plus the class enum when supplied."""
+def normalize_failure_classes(failure_classes: Optional[FailureClassSpec] = None) -> Dict[str, str]:
+    """Coerce either accepted shape into an ordered identifier -> description map.
+
+    A bare sequence yields empty descriptions, which is still a usable enum - the
+    identifier then has to carry its own meaning.
+    """
     if not failure_classes:
+        return {}
+    items = failure_classes.items() if isinstance(failure_classes, Mapping) else ((c, "") for c in failure_classes)
+    normalized: Dict[str, str] = {}
+    for identifier, description in items:
+        key = str(identifier or "").strip()
+        if key:
+            normalized[key] = str(description or "").strip()
+    return normalized
+
+
+def resolve_failure_class_fallback(failure_classes: Optional[FailureClassSpec] = None,
+                                   explicit: Optional[str] = None) -> str:
+    """The identifier to record when the model's answer is unusable.
+
+    It has to be a member of the caller's own enum. Hardcoding one here would let
+    this module emit a value outside the closed list it promises to honour, and
+    would break silently the day the owner of the enum renamed that class.
+    """
+    classes = normalize_failure_classes(failure_classes)
+    if not classes:
+        return ""
+    if explicit and explicit.strip():
+        candidate = explicit.strip()
+        if candidate not in classes:
+            raise ValueError(
+                f"failure-class fallback {candidate!r} is not one of the supplied classes: "
+                f"{', '.join(classes)}"
+            )
+        return candidate
+    if DEFAULT_UNCLASSIFIED_FALLBACK in classes:
+        return DEFAULT_UNCLASSIFIED_FALLBACK
+    raise ValueError(
+        f"{DEFAULT_UNCLASSIFIED_FALLBACK!r} is not among the supplied classes, so there is "
+        f"no default to fall back on; name one explicitly out of: {', '.join(classes)}"
+    )
+
+
+def build_analysis_format_instructions(failure_classes: Optional[FailureClassSpec] = None,
+                                       fallback: Optional[str] = None) -> str:
+    """Schema block for the aggregation prompt, plus the class enum when supplied."""
+    classes = normalize_failure_classes(failure_classes)
+    if not classes:
         return ANALYSIS_FORMAT_INSTRUCTIONS
-    listed = "\n".join(f"  - {c}" for c in failure_classes)
-    return ANALYSIS_FORMAT_INSTRUCTIONS + FAILURE_CLASS_INSTRUCTIONS.format(classes=listed)
+    fallback = fallback or resolve_failure_class_fallback(classes)
+    listed = "\n".join(
+        f"  - {identifier}: {description}" if description else f"  - {identifier}"
+        for identifier, description in classes.items()
+    )
+    # With descriptions, point the model at them: matching a described signature is
+    # a far more reliable ask than inferring intent from an identifier alone.
+    match_rule = (
+        "- Match the failure against the descriptions above and choose the one it fits.\n"
+        "  Where a description names a log signature, that signature is what decides.\n"
+        if any(classes.values()) else
+        "- Choose the identifier that best fits the failure you described.\n"
+    )
+    return ANALYSIS_FORMAT_INSTRUCTIONS + FAILURE_CLASS_INSTRUCTIONS.format(
+        classes=listed, match_rule=match_rule, fallback=fallback
+    )
 
 CHUNK_FORMAT_INSTRUCTIONS = """
 Provide a concise summary (up to 10 sentences) of the most important issues found in this chunk. Include the main relevant log lines that led to this conclusion (up to 5 lines).
@@ -80,16 +152,21 @@ class AnalysisResult:
     action_suggestion: str
     human_summary: str
     failure_class: str = ""
+    classification_context: str = ""
 
 class LLMAnalyzer:
     """Handles analysis logic and prompting using an LLM provider."""
     
     def __init__(self, provider: LLMProvider, debug_output_dir: Optional[str] = None,
-                 failure_classes: Optional[List[str]] = None):
+                 failure_classes: Optional[FailureClassSpec] = None,
+                 failure_class_fallback: Optional[str] = None):
         self.provider = provider
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         self.debug_output_dir = debug_output_dir
-        self.failure_classes = list(failure_classes) if failure_classes else []
+        self.failure_classes = normalize_failure_classes(failure_classes)
+        self.failure_class_fallback = resolve_failure_class_fallback(
+            self.failure_classes, failure_class_fallback
+        )
     
     def _save_debug_prompt(self, prompt: str, filename: str) -> None:
         """Save the final formatted prompt to a debug file."""
@@ -151,20 +228,31 @@ class LLMAnalyzer:
         
         formatted_prompt = prompt_intro + "\n\n" + AGGREGATION_ANALYSIS_INSTRUCTION
         formatted_prompt += "\n\n---\n\n" + chunk_header_text + chunk_summaries_text
-        formatted_prompt += build_analysis_format_instructions(self.failure_classes)
+        formatted_prompt += build_analysis_format_instructions(
+            self.failure_classes, self.failure_class_fallback
+        )
         
-        if additional_context.strip():
+        has_context = bool(additional_context.strip())
+        if has_context:
             formatted_prompt += f"\n\n---\n\nAdditional Context:\n{additional_context}"
+        
+        # Recorded from the prompt we actually sent, not from what the model says
+        # about it. Only meaningful when a class was asked for.
+        classification_context = ""
+        if self.failure_classes:
+            classification_context = (
+                CLASSIFICATION_CONTEXT_PROVIDED if has_context else CLASSIFICATION_CONTEXT_ABSENT
+            )
         
         self._save_debug_prompt(formatted_prompt, AGGREGATION_PROMPT_FILE)
         
         response = self.provider.make_request(model, formatted_prompt)
         self._save_debug_response(response, AGGREGATION_RESPONSE_FILE)
         
-        return self._parse_aggregation_response(response)
+        return self._parse_aggregation_response(response, classification_context)
     
     def _validate_failure_class(self, value: Any) -> str:
-        """Coerce the model's class to one we asked for; anything else is `unknown`."""
+        """Coerce the model's class to one we asked for; anything else is the fallback."""
         if not self.failure_classes:
             return ""
         candidate = str(value or "").strip()
@@ -173,11 +261,11 @@ class LLMAnalyzer:
         if candidate:
             self.logger.warning(
                 f"Model returned failure_class {candidate!r}, which is not in the "
-                f"supplied enum; recording {UNCLASSIFIED_FALLBACK!r} instead"
+                f"supplied enum; recording {self.failure_class_fallback!r} instead"
             )
-        return UNCLASSIFIED_FALLBACK
+        return self.failure_class_fallback
 
-    def _parse_aggregation_response(self, response: str) -> AnalysisResult:
+    def _parse_aggregation_response(self, response: str, classification_context: str = "") -> AnalysisResult:
         """Parse the aggregation response to extract structured data."""
         try:
             json_str = self._sanitize_json_string(response.strip())
@@ -190,6 +278,7 @@ class LLMAnalyzer:
                 action_suggestion=analysis_data.get("action_suggestion", "No specific action suggested"),
                 human_summary=analysis_data.get("human_summary", "No human summary was found in the response"),
                 failure_class=self._validate_failure_class(analysis_data.get("failure_class")),
+                classification_context=classification_context,
             )
             
         except json.JSONDecodeError as e:
@@ -198,7 +287,7 @@ class LLMAnalyzer:
             self.logger.debug(f"Extracted JSON block: {repr(json_str)}")
             self.logger.debug(f"Full response: {repr(response)}")
             
-            return self._fallback_parse_response(response, str(e))
+            return self._fallback_parse_response(response, str(e), classification_context)
             
         except Exception as e:
             self.logger.error(f"Failed to parse aggregation response: {e}")
@@ -210,7 +299,8 @@ class LLMAnalyzer:
                 confidence=0.0,
                 action_suggestion="Review logs manually",
                 human_summary=f"Analysis failed due to parsing error: {str(e)}",
-                failure_class=UNCLASSIFIED_FALLBACK if self.failure_classes else "",
+                failure_class=self.failure_class_fallback,
+                classification_context=classification_context,
             )
     
     def _sanitize_json_string(self, json_str: str) -> str:
@@ -260,13 +350,15 @@ class LLMAnalyzer:
             
             return '\n'.join(lines)
     
-    def _fallback_parse_response(self, response: str, error_msg: str) -> AnalysisResult:
+    def _fallback_parse_response(self, response: str, error_msg: str,
+                                 classification_context: str = "") -> AnalysisResult:
         """Fallback parsing when JSON fails - extract info using regex."""
         self.logger.info("Attempting fallback parsing using regex extraction")
         
         root_cause = "Unable to parse root cause from response"
         confidence = 0
         action_suggestion = "Review the raw LLM response manually"
+        failure_class = self.failure_class_fallback
         
         try:
             root_cause_match = re.search(r'"root_cause":\s*"([^"]*)"', response)
@@ -280,6 +372,13 @@ class LLMAnalyzer:
             action_match = re.search(r'"action_suggestion":\s*"([^"]*)"', response)
             if action_match:
                 action_suggestion = action_match.group(1)
+            
+            # Malformed JSON elsewhere is no reason to discard a class the model did
+            # emit; validation still gates what we accept.
+            if self.failure_classes:
+                class_match = re.search(r'"failure_class":\s*"([^"]*)"', response)
+                if class_match:
+                    failure_class = self._validate_failure_class(class_match.group(1))
                 
             summary_start = response.find('HUMAN SUMMARY:')
             if summary_start != -1:
@@ -297,13 +396,14 @@ class LLMAnalyzer:
             confidence=confidence,
             action_suggestion=action_suggestion,
             human_summary=human_summary,
-            failure_class=UNCLASSIFIED_FALLBACK if self.failure_classes else "",
+            failure_class=failure_class,
+            classification_context=classification_context,
         )
 
 class LLMClient:
     """Main LLM client that uses different providers and analyzers."""
     
-    def __init__(self, provider, debug_output_dir: str = ".", chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None, failure_classes: Optional[List[str]] = None):
+    def __init__(self, provider, debug_output_dir: str = ".", chunk_model: Optional[str] = None, aggregation_model: Optional[str] = None, failure_classes: Optional[FailureClassSpec] = None, failure_class_fallback: Optional[str] = None):
         """
         Initialize the LLM client with a specific provider.
         
@@ -312,15 +412,19 @@ class LLMClient:
             debug_output_dir: Directory for debug output files
             chunk_model: Model to use for chunk analysis (if not provided, uses provider default)
             aggregation_model: Model to use for aggregation analysis (if not provided, uses provider default)
-            failure_classes: Closed list of failure-class identifiers the model must choose from.
-                When omitted, no classification is requested and the prompt is unchanged.
+            failure_classes: Closed set of failure-class identifiers the model must choose
+                from, either bare identifiers or identifier -> description. When omitted,
+                no classification is requested and the prompt is unchanged.
+            failure_class_fallback: Which of those identifiers to record when the model's
+                answer is unusable. Defaults to "unknown" when the set contains it.
         """
         self.provider_type = type(provider).__name__
         self.provider = provider
         self.logger = logging.getLogger(__name__)
         self.chunk_model = chunk_model or self.provider.get_default_chunk_model()
         self.aggregation_model = aggregation_model or self.provider.get_default_aggregation_model()
-        self.analyzer = LLMAnalyzer(self.provider, debug_output_dir, failure_classes=failure_classes)
+        self.analyzer = LLMAnalyzer(self.provider, debug_output_dir, failure_classes=failure_classes,
+                                    failure_class_fallback=failure_class_fallback)
 
         self.logger.info(f"Initialized LLM client with provider {self.provider_type}, aggregation model {self.aggregation_model}, chunk model {self.chunk_model}")
     

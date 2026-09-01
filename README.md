@@ -168,11 +168,12 @@ The analyzer generates two output files:
   "confidence": 0.95,
   "action_suggestion": "Add a definition for the 'Armadillo' character to the 'CharacterEnum' enum in the CharacterSoundControllerFactory.cs file. Ensure the enum is updated whenever new characters are introduced.",
   "human_summary": "The Unity build failed due to a script compilation error. The error message indicates that `CharacterEnum` is missing a definition for 'Armadillo'.  This likely happened because a new character, 'Armadillo', was added without updating the corresponding enum. To fix this, add a new entry for 'Armadillo' to the `CharacterEnum` enum in the `CharacterSoundControllerFactory.cs` file.",
-  "failure_class": ""
+  "failure_class": "",
+  "classification_context": ""
 }
 ```
 
-`failure_class` is empty unless `--failure-classes` is supplied; see
+Both fields are empty unless `--failure-classes` is supplied; see
 [Classifying failures](#classifying-failures).
 
 ### Classifying failures
@@ -181,12 +182,28 @@ The analyzer generates two output files:
 identifiers you supply, and records its choice in `failure_class`:
 
 ```bash
-# inline
-llm-log-analyzer build.log --failure-classes licensing_down,dependency,project_code,unknown
+# inline, bare identifiers
+llm-log-analyzer build.log --failure-classes licensing_down,project_code,unknown
 
-# or from a file, one identifier per line (`#` comments allowed)
+# or from a file, one entry per line (`#` comments allowed)
 llm-log-analyzer build.log --failure-classes @enum.txt
 ```
+
+Each entry may carry a description, which is what the model is told to match the
+failure against:
+
+```
+# enum.txt
+licensing_down: The shared licence server could not issue a licence - exit 198.
+project_code: Compilation failure with diagnostics present in the log.
+unknown: Nothing in the log corroborates any class above.
+unknown_no_signal: The build failed without recording why.
+```
+
+Descriptions are worth writing. An identifier alone leaves the model inferring what
+you meant, and near-neighbours — `unknown` against `unknown_no_signal`, one
+licensing failure mode against another — are not distinguishable from the name.
+Use `@PATH` for described enums, since a description may contain commas.
 
 The analyzer deliberately does **not** ship an enum of its own. Whatever consumes
 the classification — a metrics exporter, a dashboard, an alerting rule — owns the
@@ -195,17 +212,36 @@ queries built on it.
 
 Guarantees worth relying on:
 
-- **Opt-in.** Without the flag the prompt and the output are unchanged, and
-  `failure_class` is `""`.
-- **Closed.** A value outside your list is replaced with `unknown` and logged as a
-  warning. The model cannot widen the enum by inventing an identifier.
+- **Opt-in.** Without the flag the prompt and the output are unchanged, and both
+  fields are `""`.
+- **Closed.** A value outside your list is replaced with the fallback class and
+  logged as a warning. The model cannot widen the enum by inventing an identifier.
 - **Always present when asked.** Every path — a value outside the list, a missing
-  key, an unparseable response — yields `unknown` rather than an empty or absent
-  field, so a consumer can distinguish "the analyzer ran and could not classify"
-  from "the analyzer never ran".
+  key, an unparseable response — yields a class from *your* list rather than an
+  empty or absent field, so a consumer can distinguish "the analyzer ran and could
+  not classify" from "the analyzer never ran".
+- **The fallback is yours too.** It defaults to `unknown` when your list contains
+  that identifier, and `--failure-class-fallback` names a different one.
+- **Never fatal.** A missing enum file, an empty list, or a fallback that resolves
+  to nothing warns on stderr and disables classification for that run - it does not
+  fail the analysis. `failure_class` is then `""`, exactly as if no class had been
+  asked for, and the log analysis a developer reads is unaffected. Classification
+  is an addition to the analysis, not a precondition for it.
 
-Include `unknown` in your list and say so in the identifier names: the model is
-told the class describes *who owns* the failure, not what the error text said.
+  What it will never do is pick an arbitrary member of your list as the fallback.
+  Recording a real class when the model meant "no idea" misattributes the failure,
+  which is worse than recording nothing.
+
+#### Was the class chosen with context?
+
+`classification_context` records whether `--additional-context-file` reached the
+prompt that chose the class: `provided` or `absent`.
+
+It is a fact about the request, not the model's opinion of it. `confidence` is the
+model grading its own answer, and does not track correctness — the same 0.99 will
+sit on a wrong class and on its corrected replacement. Whether the model had your
+known-errors context when it classified is checkable, and it measurably changes the
+class it picks, so a consumer can require context before acting on a class.
 
 2. **`analysis.md`** - Human-friendly Markdown summary for Slack/MR comments:
 ```markdown
