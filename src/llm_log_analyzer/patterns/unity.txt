@@ -10,3 +10,10 @@ Gradle build failed
 [Package Manager] Error
 Asset import failed
 Compilation failed
+
+# CocoaPods, reached through EDM4U on iOS builds
+[!]
+CocoaPods could not find compatible versions
+Found multiple specifications for
+does not define modules
+use_modular_headers!

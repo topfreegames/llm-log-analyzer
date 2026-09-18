@@ -26,3 +26,14 @@ swiftc failed with exit code
 Info.plist
 Bundle identifier
 
+# CocoaPods / SPM dependency resolution
+[!]
+CocoaPods could not find compatible versions
+None of your spec sources contain a spec
+Unable to find a specification for
+Unable to satisfy the following requirements
+Found multiple specifications for
+does not define modules
+use_modular_headers!
+Missing package product
+Package resolution failed
