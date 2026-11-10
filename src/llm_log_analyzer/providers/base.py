@@ -42,9 +42,22 @@ class LLMProvider(ABC):
         """Make an API request to the provider. Implemented by subclasses."""
         pass
     
+    @staticmethod
+    def _is_model_not_found(error: Exception) -> bool:
+        text = str(error).lower()
+        return "404" in text and "not found" in text
+
+    def _fallback_model(self, model: str) -> Optional[str]:
+        """The other default model, tried once when a model is retired (404)."""
+        for candidate in (self.get_default_chunk_model(), self.get_default_aggregation_model()):
+            if candidate != model:
+                return candidate
+        return None
+
     def make_request(self, model: str, prompt: str) -> str:
         """Make a request with exponential backoff retry and optional timeout."""
         last_exception = None
+        fallback_used = False
         
         for attempt in range(self.max_retries + 1):
             try:
@@ -61,6 +74,12 @@ class LLMProvider(ABC):
             except Exception as e:
                 last_exception = e
                 self.logger.warning(f"API request failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
+
+                fallback = None if fallback_used else self._fallback_model(model)
+                if self._is_model_not_found(e) and fallback:
+                    self.logger.warning(f"Model {model} not found; retrying with {fallback}")
+                    model, fallback_used = fallback, True
+                    continue
                 
                 if attempt < self.max_retries:
                     sleep_time = self.backoff_factor ** attempt

@@ -17,7 +17,9 @@ class GeminiProvider(LLMProvider):
             from google import genai
             if not self.api_key:
                 raise Exception("Gemini API key is required")
-            self._client = genai.Client(api_key=self.api_key)
+            from google.genai import types
+            # The -latest aliases exist only on v1beta; google-genai 3.0 defaults to v1, where they 404.
+            self._client = genai.Client(api_key=self.api_key, http_options=types.HttpOptions(api_version="v1beta"))
         except ImportError:
             raise ImportError(
                 "google-genai package is required for Gemini provider. "
