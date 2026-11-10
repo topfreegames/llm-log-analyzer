@@ -684,6 +684,10 @@ def format_analysis_summary(result: AnalysisResult, provider_info: dict, markdow
         summary_parts.append(f"Failure Class: {result.failure_class}")
     summary_parts.append(f"Confidence: {confidence_emoji} {result.confidence:.1%}")
     summary_parts.append(f"Provider: {provider_info['provider']}")
+    if getattr(result, "models_used", None):
+        summary_parts.append(f"Model: {', '.join(result.models_used)}")
+    for fallback in getattr(result, "model_fallbacks", []):
+        summary_parts.append(f"⚠️ Model fallback: {fallback}. Update the provider's default model.")
     
     if result.relevant_lines:
         summary_parts.append("\nKey Log Lines:")
@@ -1021,6 +1025,9 @@ Examples:
         )
         
         result, has_failures = analyzer.analyze_log_file(args.log, args.tail_lines)
+        provider = analyzer.llm_client.provider
+        result.models_used = list(dict.fromkeys(provider.models_used))
+        result.model_fallbacks = list(dict.fromkeys(provider.model_fallbacks))
         
         _, markdown_path = analyzer.save_results(result)
         

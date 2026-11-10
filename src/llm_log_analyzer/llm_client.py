@@ -8,7 +8,7 @@ import logging
 import re
 import os
 from typing import Dict, Any, Mapping, Optional, List, Sequence, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from llm_log_analyzer.constants import CHUNK_PROMPT_FILE, AGGREGATION_PROMPT_FILE, CHUNK_RESPONSE_FILE, AGGREGATION_RESPONSE_FILE
 from llm_log_analyzer.providers import LLMProvider
 
@@ -153,6 +153,8 @@ class AnalysisResult:
     human_summary: str
     failure_class: str = ""
     classification_context: str = ""
+    models_used: List[str] = field(default_factory=list)
+    model_fallbacks: List[str] = field(default_factory=list)
 
 class LLMAnalyzer:
     """Handles analysis logic and prompting using an LLM provider."""

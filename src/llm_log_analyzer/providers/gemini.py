@@ -38,7 +38,22 @@ class GeminiProvider(LLMProvider):
         return "cl100k_base"
 
     def _make_api_request(self, model: str, prompt: str) -> str:
-        """Make request to Gemini API."""
+        """Make request to Gemini API, falling back once to the other default model on a 404."""
+        from google.genai import errors
+
+        try:
+            return self._generate(model, prompt)
+        except errors.APIError as e:
+            fallback = next((m for m in (self.get_default_chunk_model(), self.get_default_aggregation_model()) if m != model), None)
+            if e.code != 404 or not fallback:
+                raise
+            self.logger.warning(f"Gemini model {model} returned 404 (retired?); answering with {fallback}")
+            self.model_fallbacks.append(f"{model} -> {fallback} (404)")
+            response = self._generate(fallback, prompt)
+            self._answered_model = fallback
+            return response
+
+    def _generate(self, model: str, prompt: str) -> str:
         from google.genai import types
 
         config = types.GenerateContentConfig(
