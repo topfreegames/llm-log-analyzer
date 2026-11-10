@@ -5,7 +5,7 @@ Base classes and constants for LLM providers.
 import time
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 # Model constants
@@ -21,6 +21,10 @@ class LLMProvider(ABC):
         self.backoff_factor = backoff_factor
         self.timeout = timeout  # None means no timeout (default behavior)
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        # Models that actually answered, and any fallback a provider took (e.g. a retired model).
+        self.models_used: List[str] = []
+        self.model_fallbacks: List[str] = []
+        self._answered_model: Optional[str] = None
     
     @abstractmethod
     def get_default_chunk_model(self) -> str:
@@ -52,11 +56,14 @@ class LLMProvider(ABC):
                     with ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(self._make_api_request, model, prompt)
                         try:
-                            return future.result(timeout=self.timeout)
+                            response = future.result(timeout=self.timeout)
                         except FutureTimeoutError:
                             raise TimeoutError(f"API request timed out after {self.timeout} seconds")
                 else:
-                    return self._make_api_request(model, prompt)
+                    response = self._make_api_request(model, prompt)
+                self.models_used.append(self._answered_model or model)
+                self._answered_model = None
+                return response
                 
             except Exception as e:
                 last_exception = e
